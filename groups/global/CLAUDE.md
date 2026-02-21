@@ -47,6 +47,18 @@ When you learn something important:
 - Split files larger than 500 lines into folders
 - Keep an index in your memory for the files you create
 
+## Timezone
+
+This system operates on *Pacific Standard Time (PST, UTC-8)*. The server clock runs UTC — always convert to PST when:
+- Displaying times to users
+- Scheduling tasks (use PST in cron/schedule values)
+- Logging timestamps in notes or messages
+- Delegating tasks to sub-agents (pass the PST time explicitly)
+
+Example: server time 03:00 UTC = 7:00pm PST the previous day.
+
+When in doubt, state the time as PST explicitly: "sent at 7:30pm PST" not just the raw timestamp.
+
 ## Message Formatting
 
 NEVER use markdown. Only use WhatsApp/Telegram formatting:
@@ -56,3 +68,24 @@ NEVER use markdown. Only use WhatsApp/Telegram formatting:
 - ```triple backticks``` for code
 
 No ## headings. No [links](url). No **double stars**.
+
+## Image Messages
+
+When a message contains `[Image: /workspace/ipc/media/filename.jpg]`, the user sent a photo. Use the Read tool to view the image:
+
+```
+Read /workspace/ipc/media/filename.jpg
+```
+
+You can natively see and understand images read this way. Use this to:
+- Read receipts, labels, or documents in photos
+- Identify products or items
+- Answer questions about what's shown in the image
+
+Any caption the user included appears on the line after the image reference. Always read the image before responding — don't ask the user to describe it.
+
+## Voice Messages
+
+When a message contains `[Voice: transcribed text here]`, the user sent a voice note that was automatically transcribed. Treat the transcribed text as if the user had typed it directly. Respond naturally based on the content.
+
+If you see `[Voice Message - transcription unavailable]` or similar, the voice note couldn't be transcribed. Let the user know you received a voice message but couldn't read it, and ask them to resend or type their message.

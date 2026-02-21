@@ -21,8 +21,10 @@ RUN apt-get update && apt-get install -y \
     libcups2 \
     libdrm2 \
     libxshmfence1 \
+    postgresql-client \
     curl \
     git \
+    docker.io \
     && rm -rf /var/lib/apt/lists/*
 
 # Set Chromium path for agent-browser
@@ -57,6 +59,11 @@ RUN printf '#!/bin/bash\nset -e\ncd /app && npx tsc --outDir /tmp/dist 2>&1 >&2\
 
 # Set ownership to node user (non-root) for writable directories
 RUN chown -R node:node /workspace
+
+# Create .claude directory for the Claude Agent SDK (debug logs, session data)
+# The SDK tries to mkdir /home/node/.claude/debug on a timer callback and crashes
+# with EACCES if this directory doesn't exist and isn't writable by the node user.
+RUN mkdir -p /home/node/.claude/debug && chown -R node:node /home/node/.claude
 
 # Switch to non-root user (required for --dangerously-skip-permissions)
 USER node

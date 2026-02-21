@@ -1,4 +1,3 @@
-import { ChildProcess } from 'child_process';
 import { CronExpressionParser } from 'cron-parser';
 import fs from 'fs';
 import path from 'path';
@@ -10,7 +9,11 @@ import {
   SCHEDULER_POLL_INTERVAL,
   TIMEZONE,
 } from './config.js';
-import { ContainerOutput, runContainerAgent, writeTasksSnapshot } from './container-runner.js';
+import {
+  AgentOutput,
+  runAgent,
+  writeTasksSnapshot,
+} from './agent-runner.js';
 import {
   getAllTasks,
   getDueTasks,
@@ -26,7 +29,6 @@ export interface SchedulerDependencies {
   registeredGroups: () => Record<string, RegisteredGroup>;
   getSessions: () => Record<string, string>;
   queue: GroupQueue;
-  onProcess: (groupJid: string, proc: ChildProcess, containerName: string, groupFolder: string) => void;
   sendMessage: (jid: string, text: string) => Promise<void>;
 }
 
@@ -64,7 +66,7 @@ async function runTask(
     return;
   }
 
-  // Update tasks snapshot for container to read (filtered by group)
+  // Update tasks snapshot for agent to read (filtered by group)
   const isMain = task.group_folder === MAIN_GROUP_FOLDER;
   const tasks = getAllTasks();
   writeTasksSnapshot(
@@ -84,25 +86,28 @@ async function runTask(
   let result: string | null = null;
   let error: string | null = null;
 
-  // For group context mode, use the group's current session
+  // For group context mode, use the group's current session (keyed by chatJid)
   const sessions = deps.getSessions();
   const sessionId =
-    task.context_mode === 'group' ? sessions[task.group_folder] : undefined;
+    task.context_mode === 'group' ? sessions[task.chat_jid] : undefined;
 
-  // Idle timer: writes _close sentinel after IDLE_TIMEOUT of no output,
-  // so the container exits instead of hanging at waitForIpcMessage forever.
+  // Idle timer: closes the agent's MessageStream after IDLE_TIMEOUT of no output,
+  // so the query loop exits instead of waiting for follow-up messages forever.
   let idleTimer: ReturnType<typeof setTimeout> | null = null;
+  let agentHandle: ReturnType<typeof runAgent> | null = null;
 
   const resetIdleTimer = () => {
     if (idleTimer) clearTimeout(idleTimer);
     idleTimer = setTimeout(() => {
-      logger.debug({ taskId: task.id }, 'Scheduled task idle timeout, closing container stdin');
-      deps.queue.closeStdin(task.chat_jid);
+      logger.debug({ taskId: task.id }, 'Scheduled task idle timeout, closing agent');
+      if (agentHandle) {
+        agentHandle.close();
+      }
     }, IDLE_TIMEOUT);
   };
 
   try {
-    const output = await runContainerAgent(
+    agentHandle = runAgent(
       group,
       {
         prompt: task.prompt,
@@ -112,11 +117,10 @@ async function runTask(
         isMain,
         isScheduledTask: true,
       },
-      (proc, containerName) => deps.onProcess(task.chat_jid, proc, containerName, task.group_folder),
-      async (streamedOutput: ContainerOutput) => {
+      async (streamedOutput: AgentOutput) => {
         if (streamedOutput.result) {
           result = streamedOutput.result;
-          // Forward result to user (sendMessage handles formatting)
+          // Forward result to user
           await deps.sendMessage(task.chat_jid, streamedOutput.result);
           // Only reset idle timer on actual results, not session-update markers
           resetIdleTimer();
@@ -127,12 +131,20 @@ async function runTask(
       },
     );
 
+    // Register with queue so it can track the agent
+    deps.queue.registerAgent(task.chat_jid, agentHandle, task.group_folder);
+
+    // Start idle timer
+    resetIdleTimer();
+
+    // Wait for agent to complete
+    const output = await agentHandle.done;
+
     if (idleTimer) clearTimeout(idleTimer);
 
     if (output.status === 'error') {
       error = output.error || 'Unknown error';
     } else if (output.result) {
-      // Messages are sent via MCP tool (IPC), result text is just logged
       result = output.result;
     }
 

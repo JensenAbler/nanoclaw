@@ -5,12 +5,16 @@ import path from 'path';
 import makeWASocket, {
   Browsers,
   DisconnectReason,
+  WAMessage,
   WASocket,
+  downloadMediaMessage,
   makeCacheableSignalKeyStore,
   useMultiFileAuthState,
 } from '@whiskeysockets/baileys';
 
 import { ASSISTANT_HAS_OWN_NUMBER, ASSISTANT_NAME, STORE_DIR } from '../config.js';
+import { formatImageContent, saveImageToIpc } from '../media.js';
+import { transcribeAudio, formatVoiceContent } from '../transcription.js';
 import {
   getLastGroupSync,
   setLastGroupSync,
@@ -163,12 +167,69 @@ export class WhatsAppChannel implements Channel {
         // Only deliver full message for registered groups
         const groups = this.opts.registeredGroups();
         if (groups[chatJid]) {
-          const content =
+          // Debug: log message keys to diagnose unexpected message types
+          if (msg.message && !msg.message.conversation && !msg.message.extendedTextMessage && !msg.message.imageMessage) {
+            logger.info({ msgKeys: Object.keys(msg.message) }, 'Non-standard message type received');
+          }
+
+          let content =
             msg.message?.conversation ||
             msg.message?.extendedTextMessage?.text ||
-            msg.message?.imageMessage?.caption ||
             msg.message?.videoMessage?.caption ||
             '';
+
+          // Handle image messages: download and save so the agent can view them
+          if (msg.message?.imageMessage) {
+            const caption = msg.message.imageMessage.caption || '';
+            const imagePath = await this.downloadAndSaveImage(
+              msg as WAMessage,
+              groups[chatJid].folder,
+            );
+            if (imagePath) {
+              content = formatImageContent(imagePath, caption || undefined);
+            } else {
+              // Download failed — fall back to caption only
+              content = caption || '[Image: download failed]';
+            }
+          }
+
+          // Handle voice messages (ptt or any audioMessage): download and transcribe
+          if (msg.message?.audioMessage) {
+            try {
+              const audioBuffer = await this.downloadAudio(msg as WAMessage);
+              if (audioBuffer) {
+                const mimetype = msg.message.audioMessage.mimetype || 'audio/ogg';
+                const transcript = await transcribeAudio(audioBuffer, mimetype);
+                content = formatVoiceContent(transcript);
+                logger.info({ chatJid, length: transcript.length }, 'Transcribed WhatsApp voice message');
+              } else {
+                content = '[Voice Message - download failed]';
+              }
+            } catch (err) {
+              logger.error({ err }, 'Failed to process WhatsApp voice message');
+              content = '[Voice Message - processing failed]';
+            }
+          }
+
+          // Handle document messages that are audio files (e.g. m4a sent as attachment)
+          const docMimetype = msg.message?.documentMessage?.mimetype || '';
+          if (msg.message?.documentMessage && docMimetype.startsWith('audio/')) {
+            try {
+              const audioBuffer = await this.downloadAudio(msg as WAMessage);
+              if (audioBuffer) {
+                const transcript = await transcribeAudio(audioBuffer, docMimetype);
+                const filename = msg.message.documentMessage.fileName || 'audio file';
+                content = formatVoiceContent(transcript);
+                logger.info({ chatJid, filename, length: transcript.length }, 'Transcribed WhatsApp audio document');
+              } else {
+                content = '[Audio file - download failed]';
+              }
+            } catch (err) {
+              logger.error({ err }, 'Failed to process WhatsApp audio document');
+              content = '[Audio file - processing failed]';
+            }
+          }
+
           const sender = msg.key.participant || msg.key.remoteJid || '';
           const senderName = msg.pushName || sender.split('@')[0];
 
@@ -276,6 +337,65 @@ export class WhatsAppChannel implements Channel {
       logger.info({ count }, 'Group metadata synced');
     } catch (err) {
       logger.error({ err }, 'Failed to sync group metadata');
+    }
+  }
+
+  /**
+   * Download an image from a WhatsApp message and save it to the group's
+   * IPC media directory so the agent container can read it.
+   */
+  private async downloadAndSaveImage(
+    msg: WAMessage,
+    groupFolder: string,
+  ): Promise<string | null> {
+    try {
+      const buffer = (await downloadMediaMessage(
+        msg,
+        'buffer',
+        {},
+        {
+          logger: logger as any,
+          reuploadRequest: this.sock.updateMediaMessage,
+        },
+      )) as Buffer;
+
+      const mimetype =
+        msg.message?.imageMessage?.mimetype || 'image/jpeg';
+      const msgId = msg.key.id || `img-${Date.now()}`;
+
+      return saveImageToIpc(buffer, groupFolder, msgId, mimetype);
+    } catch (err) {
+      logger.error({ err }, 'Failed to download WhatsApp image');
+      return null;
+    }
+  }
+
+  /**
+   * Download audio from a WhatsApp voice message.
+   * Returns the raw audio buffer for transcription.
+   */
+  private async downloadAudio(msg: WAMessage): Promise<Buffer | null> {
+    try {
+      const buffer = (await downloadMediaMessage(
+        msg,
+        'buffer',
+        {},
+        {
+          logger: logger as any,
+          reuploadRequest: this.sock.updateMediaMessage,
+        },
+      )) as Buffer;
+
+      if (!buffer || buffer.length === 0) {
+        logger.warn('downloadAudio: empty buffer');
+        return null;
+      }
+
+      logger.info({ size: buffer.length }, 'Downloaded WhatsApp voice message');
+      return buffer;
+    } catch (err) {
+      logger.error({ err }, 'Failed to download WhatsApp audio');
+      return null;
     }
   }
 

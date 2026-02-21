@@ -1,3 +1,4 @@
+import { exec } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
@@ -9,7 +10,7 @@ import {
   MAIN_GROUP_FOLDER,
   TIMEZONE,
 } from './config.js';
-import { AvailableGroup } from './container-runner.js';
+import { AvailableGroup } from './agent-runner.js';
 import { createTask, deleteTask, getTaskById, updateTask } from './db.js';
 import { logger } from './logger.js';
 import { RegisteredGroup } from './types.js';
@@ -26,6 +27,11 @@ export interface IpcDeps {
     availableGroups: AvailableGroup[],
     registeredJids: Set<string>,
   ) => void;
+  discord?: {
+    sendDM: (memberName: string, text: string) => Promise<boolean>;
+    listMembers: () => Promise<Array<{ id: string; name: string; username: string }>>;
+    findMemberByName: (name: string) => Promise<{ id: string; displayName: string; username: string } | null>;
+  };
 }
 
 let ipcWatcherRunning = false;
@@ -169,6 +175,8 @@ export async function processTaskIpc(
     trigger?: string;
     requiresTrigger?: boolean;
     containerConfig?: RegisteredGroup['containerConfig'];
+    // For discord_dm
+    text?: string;
   },
   sourceGroup: string, // Verified identity from IPC directory
   isMain: boolean, // Verified from directory path
@@ -372,6 +380,97 @@ export async function processTaskIpc(
         );
       }
       break;
+
+    case 'restart_service': {
+      // Only main group can trigger a restart
+      if (!isMain) {
+        logger.warn(
+          { sourceGroup },
+          'Unauthorized restart_service attempt blocked',
+        );
+        break;
+      }
+
+      const restartReplyJid = data.chatJid;
+      const restartNotify = async (text: string) => {
+        if (restartReplyJid) {
+          try {
+            await deps.sendMessage(restartReplyJid, text);
+          } catch (err) {
+            logger.warn({ err }, 'Failed to send restart status message');
+          }
+        }
+      };
+
+      logger.info('Service restart requested via IPC');
+
+      const restartProjectRoot = path.resolve(DATA_DIR, '..');
+
+      // Compile TypeScript first so host-side changes take effect
+      exec(
+        'npm run build',
+        { cwd: restartProjectRoot, timeout: 30000 },
+        async (buildErr, _buildStdout, buildStderr) => {
+          if (buildErr) {
+            logger.error({ err: buildErr, stderr: buildStderr }, 'Build failed before restart');
+            await restartNotify(`❌ Build failed, restart aborted:\n\`\`\`${buildStderr.slice(-500)}\`\`\``);
+            return;
+          }
+
+          logger.info('Build succeeded, restarting service...');
+          await restartNotify('🔄 Build complete. Restarting service...');
+
+          // Short delay to let the message send before we die
+          setTimeout(() => {
+            exec('systemctl --user restart nanoclaw', { timeout: 10000 }, (err) => {
+              if (err) {
+                logger.error({ err }, 'Failed to restart service');
+                // Process might already be dead, but try to notify
+                restartNotify('❌ Restart failed. You may need to restart manually.');
+              }
+            });
+          }, 1500);
+        },
+      );
+      break;
+    }
+
+    case 'discord_dm': {
+      // Send a DM to a Discord guild member by name
+      // Usage: { type: 'discord_dm', name: 'Alma', text: 'Hey, question about Thursday dinner...' }
+      if (!deps.discord) {
+        logger.warn('discord_dm: Discord not configured');
+        break;
+      }
+      if (!data.name || !data.text) {
+        logger.warn('discord_dm: missing name or text');
+        break;
+      }
+      const success = await deps.discord.sendDM(data.name, data.text);
+      if (!success) {
+        logger.warn({ name: data.name }, 'discord_dm: member not found or DM failed');
+      }
+      break;
+    }
+
+    case 'discord_list_members': {
+      // List all Discord guild members and write result to IPC output
+      // Usage: { type: 'discord_list_members' }
+      if (!deps.discord) {
+        logger.warn('discord_list_members: Discord not configured');
+        break;
+      }
+      const members = await deps.discord.listMembers();
+      logger.info({ count: members.length }, 'Discord guild members fetched');
+
+      // Write result to a file the agent can read
+      const outputDir = path.join(DATA_DIR, 'ipc', sourceGroup);
+      fs.mkdirSync(outputDir, { recursive: true });
+      const outputPath = path.join(outputDir, 'discord_members.json');
+      fs.writeFileSync(outputPath, JSON.stringify(members, null, 2));
+      logger.info({ outputPath }, 'Discord members written to IPC output');
+      break;
+    }
 
     default:
       logger.warn({ type: data.type }, 'Unknown IPC task type');

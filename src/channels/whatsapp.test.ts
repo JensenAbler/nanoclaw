@@ -6,6 +6,7 @@ import { EventEmitter } from 'events';
 // Mock config
 vi.mock('../config.js', () => ({
   STORE_DIR: '/tmp/nanoclaw-test-store',
+  DATA_DIR: '/tmp/nanoclaw-test-data',
   ASSISTANT_NAME: 'Andy',
   ASSISTANT_HAS_OWN_NUMBER: false,
 }));
@@ -45,6 +46,28 @@ vi.mock('child_process', () => ({
   exec: vi.fn(),
 }));
 
+// Mock media module
+vi.mock('../media.js', () => ({
+  saveImageToIpc: vi.fn(
+    (_buffer: Buffer, _groupFolder: string, msgId: string, mimetype: string) => {
+      const ext = mimetype.includes('png') ? 'png' : 'jpg';
+      return `/workspace/ipc/media/${msgId}.${ext}`;
+    },
+  ),
+  formatImageContent: vi.fn(
+    (containerPath: string, caption?: string) =>
+      caption ? `[Image: ${containerPath}]\n${caption}` : `[Image: ${containerPath}]`,
+  ),
+}));
+
+// Mock transcription module
+vi.mock('../transcription.js', () => ({
+  transcribeAudio: vi.fn().mockResolvedValue('Hello, this is a voice message'),
+  formatVoiceContent: vi.fn(
+    (transcript: string) => `[Voice: ${transcript}]`,
+  ),
+}));
+
 // Build a fake WASocket that's an EventEmitter with the methods we need
 function createFakeSocket() {
   const ev = new EventEmitter();
@@ -74,6 +97,7 @@ let fakeSocket: ReturnType<typeof createFakeSocket>;
 vi.mock('@whiskeysockets/baileys', () => {
   return {
     default: vi.fn(() => fakeSocket),
+    downloadMediaMessage: vi.fn(),
     Browsers: { macOS: vi.fn(() => ['macOS', 'Chrome', '']) },
     DisconnectReason: {
       loggedOut: 401,
@@ -95,8 +119,13 @@ vi.mock('@whiskeysockets/baileys', () => {
   };
 });
 
+import { downloadMediaMessage } from '@whiskeysockets/baileys';
 import { WhatsAppChannel, WhatsAppChannelOpts } from './whatsapp.js';
 import { getLastGroupSync, updateChatName, setLastGroupSync } from '../db.js';
+import { transcribeAudio } from '../transcription.js';
+
+const mockDownloadMediaMessage = vi.mocked(downloadMediaMessage);
+const mockTranscribeAudio = vi.mocked(transcribeAudio);
 
 // --- Test helpers ---
 
@@ -430,7 +459,9 @@ describe('WhatsAppChannel', () => {
       );
     });
 
-    it('extracts caption from imageMessage', async () => {
+    it('downloads image and includes path + caption in content', async () => {
+      mockDownloadMediaMessage.mockResolvedValueOnce(Buffer.from('fake-jpeg-data'));
+
       const opts = createTestOpts();
       const channel = new WhatsAppChannel(opts);
 
@@ -452,9 +483,104 @@ describe('WhatsAppChannel', () => {
         },
       ]);
 
+      expect(mockDownloadMediaMessage).toHaveBeenCalled();
       expect(opts.onMessage).toHaveBeenCalledWith(
         'registered@g.us',
-        expect.objectContaining({ content: 'Check this photo' }),
+        expect.objectContaining({
+          content: '[Image: /workspace/ipc/media/msg-6.jpg]\nCheck this photo',
+        }),
+      );
+    });
+
+    it('downloads image without caption', async () => {
+      mockDownloadMediaMessage.mockResolvedValueOnce(Buffer.from('fake-png-data'));
+
+      const opts = createTestOpts();
+      const channel = new WhatsAppChannel(opts);
+
+      await connectChannel(channel);
+
+      await triggerMessages([
+        {
+          key: {
+            id: 'msg-6b',
+            remoteJid: 'registered@g.us',
+            participant: '5551234@s.whatsapp.net',
+            fromMe: false,
+          },
+          message: {
+            imageMessage: { mimetype: 'image/png' },
+          },
+          pushName: 'Diana',
+          messageTimestamp: Math.floor(Date.now() / 1000),
+        },
+      ]);
+
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'registered@g.us',
+        expect.objectContaining({
+          content: '[Image: /workspace/ipc/media/msg-6b.png]',
+        }),
+      );
+    });
+
+    it('falls back to caption when image download fails', async () => {
+      mockDownloadMediaMessage.mockRejectedValueOnce(new Error('Network error'));
+
+      const opts = createTestOpts();
+      const channel = new WhatsAppChannel(opts);
+
+      await connectChannel(channel);
+
+      await triggerMessages([
+        {
+          key: {
+            id: 'msg-6c',
+            remoteJid: 'registered@g.us',
+            participant: '5551234@s.whatsapp.net',
+            fromMe: false,
+          },
+          message: {
+            imageMessage: { caption: 'A captioned image', mimetype: 'image/jpeg' },
+          },
+          pushName: 'Diana',
+          messageTimestamp: Math.floor(Date.now() / 1000),
+        },
+      ]);
+
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'registered@g.us',
+        expect.objectContaining({ content: 'A captioned image' }),
+      );
+    });
+
+    it('shows download failed for image without caption when download fails', async () => {
+      mockDownloadMediaMessage.mockRejectedValueOnce(new Error('Network error'));
+
+      const opts = createTestOpts();
+      const channel = new WhatsAppChannel(opts);
+
+      await connectChannel(channel);
+
+      await triggerMessages([
+        {
+          key: {
+            id: 'msg-6d',
+            remoteJid: 'registered@g.us',
+            participant: '5551234@s.whatsapp.net',
+            fromMe: false,
+          },
+          message: {
+            imageMessage: { mimetype: 'image/jpeg' },
+          },
+          pushName: 'Diana',
+          messageTimestamp: Math.floor(Date.now() / 1000),
+        },
+      ]);
+
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'registered@g.us',
+        expect.objectContaining({ content: '[Image: download failed]' }),
       );
     });
 
@@ -486,7 +612,10 @@ describe('WhatsAppChannel', () => {
       );
     });
 
-    it('handles message with no extractable text (e.g. voice note without caption)', async () => {
+    it('transcribes voice message and includes transcript in content', async () => {
+      mockDownloadMediaMessage.mockResolvedValueOnce(Buffer.from('fake-audio-data'));
+      mockTranscribeAudio.mockResolvedValueOnce('Hello, this is a voice message');
+
       const opts = createTestOpts();
       const channel = new WhatsAppChannel(opts);
 
@@ -508,10 +637,81 @@ describe('WhatsAppChannel', () => {
         },
       ]);
 
-      // Still delivered but with empty content
+      expect(mockDownloadMediaMessage).toHaveBeenCalled();
+      expect(mockTranscribeAudio).toHaveBeenCalledWith(
+        Buffer.from('fake-audio-data'),
+        'audio/ogg; codecs=opus',
+      );
       expect(opts.onMessage).toHaveBeenCalledWith(
         'registered@g.us',
-        expect.objectContaining({ content: '' }),
+        expect.objectContaining({
+          content: '[Voice: Hello, this is a voice message]',
+        }),
+      );
+    });
+
+    it('shows download failed for voice message when download fails', async () => {
+      mockDownloadMediaMessage.mockRejectedValueOnce(new Error('Network error'));
+
+      const opts = createTestOpts();
+      const channel = new WhatsAppChannel(opts);
+
+      await connectChannel(channel);
+
+      await triggerMessages([
+        {
+          key: {
+            id: 'msg-8b',
+            remoteJid: 'registered@g.us',
+            participant: '5551234@s.whatsapp.net',
+            fromMe: false,
+          },
+          message: {
+            audioMessage: { mimetype: 'audio/ogg; codecs=opus', ptt: true },
+          },
+          pushName: 'Frank',
+          messageTimestamp: Math.floor(Date.now() / 1000),
+        },
+      ]);
+
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'registered@g.us',
+        expect.objectContaining({
+          content: '[Voice Message - download failed]',
+        }),
+      );
+    });
+
+    it('shows fallback when transcription returns fallback message', async () => {
+      mockDownloadMediaMessage.mockResolvedValueOnce(Buffer.from('fake-audio-data'));
+      mockTranscribeAudio.mockResolvedValueOnce('[Voice Message - transcription unavailable]');
+
+      const opts = createTestOpts();
+      const channel = new WhatsAppChannel(opts);
+
+      await connectChannel(channel);
+
+      await triggerMessages([
+        {
+          key: {
+            id: 'msg-8c',
+            remoteJid: 'registered@g.us',
+            participant: '5551234@s.whatsapp.net',
+            fromMe: false,
+          },
+          message: {
+            audioMessage: { mimetype: 'audio/ogg; codecs=opus', ptt: true },
+          },
+          pushName: 'Frank',
+          messageTimestamp: Math.floor(Date.now() / 1000),
+        },
+      ]);
+
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'registered@g.us',
+        expect.objectContaining({
+          content: '[Voice: [Voice Message - transcription unavailable]]',
+        }),
       );
     });
 
